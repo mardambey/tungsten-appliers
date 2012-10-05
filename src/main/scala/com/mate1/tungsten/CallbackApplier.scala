@@ -1,9 +1,11 @@
-package com.mate1.casserole
+package com.mate1.tungsten
 
 import java.util.{UUID, Date}
+import java.util.ArrayList
+import java.util.Iterator
+import java.util.logging.Logger
 
 import scala.collection.JavaConversions._
-import scala.util.parsing.json._
 
 import akka.actor._
 import akka.pattern.ask
@@ -13,285 +15,130 @@ import akka.dispatch.Await
 import akka.dispatch.Future
 import akka.dispatch.Future._
 
-import org.codehaus.jackson.map.ObjectMapper
+import com.continuent.tungsten.replicator.applier.RawApplier
+import com.continuent.tungsten.replicator.ReplicatorException
+import com.continuent.tungsten.replicator.dbms.DBMSData
+import com.continuent.tungsten.replicator.dbms.LoadDataFileFragment
+import com.continuent.tungsten.replicator.dbms.OneRowChange
+import com.continuent.tungsten.replicator.dbms.RowChangeData
+import com.continuent.tungsten.replicator.dbms.RowIdData
+import com.continuent.tungsten.replicator.dbms.StatementData
+import com.continuent.tungsten.replicator.dbms.OneRowChange._
+import com.continuent.tungsten.replicator.dbms.RowChangeData.ActionType
+import com.continuent.tungsten.replicator.event.DBMSEvent
+import com.continuent.tungsten.replicator.event.ReplDBMSHeader
+import com.continuent.tungsten.replicator.plugin.PluginContext
 
-import com.netflix.astyanax.impl._
-import com.netflix.astyanax.connectionpool._
-import com.netflix.astyanax.connectionpool.impl._
-import com.netflix.astyanax.connectionpool.exceptions._
-import com.netflix.astyanax.thrift._
-import com.netflix.astyanax._
-import com.netflix.astyanax.query._
-import com.netflix.astyanax.model._
-import com.netflix.astyanax.serializers._
-import com.netflix.astyanax.util._
-import com.netflix.astyanax.retry._
-
-/**
- * TODO: add call that returns X largest rows
- * TODO: create OA dropper
- */
-
-case class Remove(cf:ColumnFamily[_, _], rowKey:Object, columnKey:Object)
-case class Decrement(cf:ColumnFamily[_, _], rowKey:Object, columnKey:Object)
-
-
-/**
- * Batches Cassandra operations by wrapping a mutation batch from Astyanax 
- * wrapping it in an Akka actor. Every time batchSize rows are mutated or 
- * when the actor is shut down it will execute the mutation.
- * 
- * TODO: add a timeout and flush if its reached.
- * 
- */
-class CassandraBatcher(ks:Keyspace, batchSize:Int = 1000) extends Actor {
-	
-	println("Batcher started...")
-	
-	var mutation = ks.prepareMutationBatch()
-	
-	def receive = {
-		case Remove(cf, rowKey, columnKey) => {
-			//mutation.withRow(cf.asInstanceOf[ColumnFamily[Object, Object]], rowKey).deleteColumn(columnKey)
-			maybeFlush match {
-				case resp => sender ! resp
-			}
-		}
-		
-		case Decrement(cf, rowKey, columnKey) => {			
-			//mutation.withRow(cf.asInstanceOf[ColumnFamily[Object, Object]], rowKey).incrementCounterColumn(columnKey, -1)
-			maybeFlush match {
-				case resp => sender ! resp
-			}
-		}
-		
-		case e => println("got unknown message: %s".format(e))
-	}
-	
-	override def postStop = {
-		flush
-	}
-	
-	protected def flush : Int = {
-		val oldSize = mutation.getRowCount()
-		//mutation.execute()
-		mutation = ks.prepareMutationBatch()
-		oldSize
-	}
-	
-	protected def maybeFlush : Int = {
-		val ret = if (mutation.getRowCount() >= batchSize) {			
-			try {
-				flush
-			} catch {
-				case e:Exception => println(e.getMessage())
-				0
-			}				
-		} else {			
-			0
-		}
-		
-		ret
-	}
+trait ApplierCallback {
+	def apply(rowChange:OneRowChange)
 }
 
-object CasseroleUtil {
-	
-	var port = 9160
-	var maxConnsPerHost = 8
-	var clusterName = "Test Cluster"
-	var keyspaceName = "TestKeyspace"
-	var socketTimeout = 600000
-	var maxTimeoutCount = 9999999
-	var timeoutWindow = 9999999
-	var seeds = "127.0.0.1:9160"
-		
-	val numRowsPerFetch = 100
-	val concurrencyLevel = 1
-	var keyspace:Keyspace = _
-	var batchSize = numRowsPerFetch * concurrencyLevel * 4
-	var batcher:ActorRef = _ 
-	
-	val system = ActorSystem("Casserole")
-	
-	var context:AstyanaxContext[Keyspace] = _
-	    
-    /**
-     * Connect to Cassandra.
-     */
-    def connect = {
-		context = new AstyanaxContext.Builder()
-		    .forCluster(clusterName)
-		    .forKeyspace(keyspaceName)
-		    .withAstyanaxConfiguration(new AstyanaxConfigurationImpl()      
-		        .setDiscoveryType(NodeDiscoveryType.NONE)
-		    )
-		    .withConnectionPoolConfiguration(new ConnectionPoolConfigurationImpl("MyConnectionPool")    
-		        .setPort(port)
-		        .setMaxConnsPerHost(maxConnsPerHost)
-		        .setSocketTimeout(socketTimeout)
-		        .setMaxTimeoutCount(maxTimeoutCount)
-		        .setTimeoutWindow(timeoutWindow)
-		        .setSeeds(seeds)
-		    )
-		    .withConnectionPoolMonitor(new CountingConnectionPoolMonitor())
-		    .buildKeyspace(ThriftFamilyFactory.getInstance())
-		
-		context.start
-		
-		keyspace = context.getEntity()
-		batcher = system.actorOf(Props(new CassandraBatcher(keyspace, batchSize)))
-	}
+trait InsertCallback extends ApplierCallback
+trait UpdateCallback extends ApplierCallback
+trait DeleteCallback extends ApplierCallback
+
+class CallbackApplier extends RawApplier {
+    val logger = Logger.getLogger(getClass.getName)
+
+    // Task management information.
+    var taskId:Int = 0
+    var serviceSchema:String = ""
+
+    // Latest event.
+    var latestHeader:ReplDBMSHeader = _            
+    var lastHeader:ReplDBMSHeader = _
+    
+    var callbacks:Option[List[ApplierCallback]] = _
     
     /**
-     * Shuts down the system and disconnects from Cassandra
+     * {@inheritDoc}
+     * 
+     * @see com.continuent.tungsten.replicator.applier.RawApplier#setTaskId(int)
      */
-    def shutdown = {
-		system.stop(batcher)		
-		system.shutdown()
-		context.shutdown()
-		println("All cleaned up!")
-	}
-	
-	def trimRows(cf:ColumnFamily[String, UUID], trimDate:Long, callback:(Rows[String, UUID] => Unit)) = {		
-		
-		println("Here we go... hold tight!")
-		
-		keyspace.prepareQuery(cf)			
-			.withRetryPolicy(new ExponentialBackoff(250, 5))
-			.getAllRows()
-			.setRowLimit(numRowsPerFetch)
-			.setRepeatLastToken(false)
-			.setConcurrencyLevel(concurrencyLevel)
-			.withColumnRange(new RangeBuilder().setLimit(50000).build())
-			.executeWithCallback(new TrimRowCallback(cf, trimDate, callback))			
-	}
-}
+    def setTaskId(id:Int) {
+        taskId = 0;
+    }
 
-class TrimRowCallback(cf:ColumnFamily[String, UUID], trimDate:Long, callback:(Rows[String, UUID] => Unit), retryOnFail:Boolean = true) 
-	extends RowCallback[String, UUID]() {
-		
-	def success(rows:Rows[String, UUID]) {
-		callback(rows)
-	}	
-	
-	def failure(e:ConnectionException) : Boolean = {
-		retryOnFail  // Returning true will continue, false will terminate the query
-	}
-}
+    /**
+     * {@inheritDoc}
+     * 
+     * @see com.continuent.tungsten.replicator.applier.RawApplier#apply(com.continuent.tungsten.replicator.event.DBMSEvent,
+     *      com.continuent.tungsten.replicator.event.ReplDBMSHeader, boolean, boolean)
+     */
+    def apply(event:DBMSEvent, header:ReplDBMSHeader, doCommit:Boolean, doRollback:Boolean) {
+    	
+    	val dbmsDataValues = event.getData()
+    	    	
+        // Iterate through values inferring the database name.
+    	dbmsDataValues.foreach(dbmsData => {
+    		
+            if (dbmsData.isInstanceOf[StatementData]) {
+            	
+                logger.fine("Ignoring statement");
+                
+            } else if (dbmsData.isInstanceOf[RowChangeData]) {
+            	
+                val rd = dbmsData.asInstanceOf[RowChangeData]
+                
+                callbacks match {
+                	case Some(xs) => {
+                		rd.getRowChanges().foreach(rowChange => xs.foreach(callback => callback.apply(rowChange)))
+                	}
+                	
+                	case _ =>                 		
+                }
+                
+            }
+            else if (dbmsData.isInstanceOf[LoadDataFileFragment])
+            {
+                logger.fine("Ignoring load data file fragment");
+            }
+            else if (dbmsData.isInstanceOf[RowIdData])
+            {
+                logger.fine("Ignoring row ID data");
+            }
+            else
+            {
+                logger.warning("Unsupported DbmsData class: " + dbmsData.getClass().getName());
+            }
+        })
 
-class CC[T] { def unapply(a:Any):Option[T] = Some(a.asInstanceOf[T]) }
+        // Mark the current header and commit position if requested.
+        latestHeader = header
+        
+        if (doCommit) commit()
+    }
 
-object M extends CC[Map[String, Any]]
-object L extends CC[List[Any]]
-object S extends CC[String]
-object D extends CC[Double]
-object B extends CC[Boolean]
+    def setCallbacks(strCallbacks:String) {
+    	callbacks = Some(strCallbacks.split(",").map(callbackName => {
+    		try {
+    			Class.forName(callbackName).newInstance()    			
+    		} catch {
+    			case e:Exception => logger.severe("Could not instantiate callback %s: %s".format(callbackName, e.getMessage))
+    			case e => logger.severe("Could not instantiate callback %s: %s".format(callbackName, e))
+    		}
+    	}).toList.asInstanceOf[List[ApplierCallback]])
+    }
+    
+    def commit() {
+        // does nothing for now...
+    }
+    
+    def rollback() {
+        // does nothing for now...
+    }
 
-object Casserole extends App {
-	import akka.util.duration._
-	val trimDate = System.currentTimeMillis - (90 days).toMillis
-	val feeds = new ColumnFamily[String, UUID]("feeds", StringSerializer.get(), TimeUUIDSerializer.get())
-	val counters = new ColumnFamily[String, String]("counters", StringSerializer.get(), StringSerializer.get())
-	
-	CasseroleUtil.seeds = "cassandra1-new.mate1:9160,cassandra2-new.mate1:9160,cassandra3.mate1:9160,cassandra4.mate1:9160"
-	CasseroleUtil.keyspaceName = "Mate1Feed"
-	CasseroleUtil.maxConnsPerHost = 24
-	
-	CasseroleUtil.connect
-	
-	var totalFlushes = 0	
-	var rowsExamined = 0
-	
-	implicit val timeout = Timeout(10 seconds)
-	implicit val system = CasseroleUtil.system
-	
-	val statsPing = CasseroleUtil.system.scheduler.schedule(0 milliseconds,
-		10 seconds,
-		CasseroleUtil.system.actorOf(Props(new Actor() {
-			def receive = {
-				case "ping" => {
-					println("Rows examined: %s".format(rowsExamined))
-					println("Total flushes: %s".format(totalFlushes))
-				}
-			}
-		})),
-	"ping")
-	
-	val COUNTROLL = "count_roll"
-	val COUNTREAD = "count_read"
-	val COUNTALL = "count_all"							
-	val ROLLEDUP = "ROLLEDUP"
-	
-	val mapper = new ObjectMapper()
-	val factory = mapper.getJsonFactory()
-	
-	println("Cleaning up until %s".format(new Date(trimDate)))
-	
-	CasseroleUtil.trimRows(feeds, trimDate, (rows => {		
-		try {
-				
-		rows.iterator.foreach(row => {
-			rowsExamined += 1
-			row.getColumns.foreach(c => {
+    def getLastEvent() : ReplDBMSHeader = lastHeader
 
+    override def configure(context:PluginContext) {
 
-				try {
-					val time = TimeUUIDUtils.getTimeFromUUID(c.getName)
-					
-					if (time < trimDate)
-					{
-						val s_time = System.currentTimeMillis()
-						
-						val Array(userId, tier) = row.getKey.split(":")																		
-						
-						val flush = CasseroleUtil.batcher ? Remove(feeds, row.getKey(), c.getName)
-						val future = tier match {
-							
-							case ROLLEDUP => {
-								(CasseroleUtil.batcher ? Decrement(Casserole.counters, userId.toString, COUNTROLL)).mapTo[Int]
-							}
-							
-							case tierN => {
-								val json = c.getStringValue														
-								val jp = factory.createJsonParser(json)
-								val jsonObj = mapper.readTree(jp)
-								val hasBeenRead = jsonObj.get("m_readFlag").asBoolean(false)								
-																
-								val readFuture = if (hasBeenRead) {
-									(CasseroleUtil.batcher ? Decrement(Casserole.counters, userId.toString, COUNTREAD)).mapTo[Int]
-								} else {
-									Future { 0 }
-								}
+    }
 
-								
-								val countAllFuture = tierN match {
-									case "TIER1" => (CasseroleUtil.batcher ? Decrement(Casserole.counters, userId.toString, COUNTALL)).mapTo[Int]
-									case _ => Future { 0 }
-								}
-								
-								Future.sequence(List(countAllFuture, readFuture)).map(_.sum)																								
-							}														
-						}
-						
-						val count = Await.result(future, 5 seconds).asInstanceOf[Int]
-						
-						if (count > 0) {
-							totalFlushes += count
-							println("Status: current row key: %s".format(row.getKey()))
-							println("Flushing done, count=%s, took %s millis, total flushes = %s.".format(count, (System.currentTimeMillis - s_time), totalFlushes))
-						}						
-					}
-					
-					//println("col: name=%s val=%s".format(new Date(c.getName.timestamp), c.getStringValue))
-				} catch {
-					case e:Exception => println(e.getMessage())
-				}
-			})
-		})} catch { case e:Exception => println (e.getMessage)}
-	}))
-	
-	sys.addShutdownHook({
-		CasseroleUtil.shutdown
-	}) 
+    override def prepare(context:PluginContext) {
+        
+    }
+
+    override def release(context:PluginContext) {
+        
+    }
 }
