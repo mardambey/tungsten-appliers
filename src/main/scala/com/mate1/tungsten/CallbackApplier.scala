@@ -7,14 +7,6 @@ import java.util.logging.Logger
 
 import scala.collection.JavaConversions._
 
-import akka.actor._
-import akka.pattern.ask
-import akka.util.duration._
-import akka.util.Timeout
-import akka.dispatch.Await
-import akka.dispatch.Future
-import akka.dispatch.Future._
-
 import com.continuent.tungsten.replicator.applier.RawApplier
 import com.continuent.tungsten.replicator.ReplicatorException
 import com.continuent.tungsten.replicator.dbms.DBMSData
