@@ -22,4 +22,9 @@ Sample configuration
     # Callback applier
     replicator.applier.callback=com.mate1.tungsten.CallbackApplier
     replicator.applier.callback.callbacks=com.mate1.tungsten.callbacks.HBaseApplierCallback
+    
+    # HBase applier
+    replicator.applier.hbase=com.mate1.tungsten.HBaseApplier
+    replicator.applier.hbase.tables=table1,table2
+    
 
